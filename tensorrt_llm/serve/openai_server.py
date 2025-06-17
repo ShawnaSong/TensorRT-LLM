@@ -7,6 +7,7 @@ from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
 from typing import AsyncGenerator, AsyncIterator, List, Optional, Tuple
+import time
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -26,6 +27,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.chat_utils import (check_multiple_response,
                                            parse_chat_messages_coroutines)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
+from tensorrt_llm.serve.metrics.prometheus_metrics import MetricsMiddleware
+from tensorrt_llm.serve.metrics.prometheus_server import PrometheusServer
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
                                                 CompletionRequest,
@@ -54,16 +57,15 @@ class OpenAIServer:
                  model: str,
                  tool_parser: str,
                  server_role: Optional[ServerRole],
-                 metadata_server_cfg: MetadataServerConfig):
+                 metadata_server_cfg: MetadataServerConfig,
+                 prometheus_port: int = 18002):
         self.llm = llm
         self.tokenizer = llm.tokenizer
         self.metadata_server = create_metadata_server(metadata_server_cfg)
         self.server_role = server_role
         self.binding_addr = None  # Will be set in __call__
-        self.tool_parser = tool_parser
-        
-        # Initialize tool call manager
-        self.tool_call_manager = ToolCallManager(self.tokenizer, self.tool_parser)
+        self.metrics = MetricsMiddleware(model)
+        self.prometheus_server = PrometheusServer(port=prometheus_port)
         hf_tokenizer_path = llm._hf_model_dir or self.tokenizer.tokenizer.name_or_path
         trust_remote_code = llm.args.trust_remote_code
         try:
@@ -218,6 +220,8 @@ class OpenAIServer:
         return JSONResponse(content=events)
 
     async def openai_chat(self, request: ChatCompletionRequest, raw_request: Request) -> Response:
+        start_time = time.time()
+        self.metrics.track_request("chat/completions")
 
         def get_role() -> str:
             if request.add_generation_prompt:
@@ -329,14 +333,18 @@ class OpenAIServer:
                                          media_type="text/event-stream")
             else:
                 response = await create_chat_response(promise, postproc_params)
+                self.metrics.track_latency("chat/completions", start_time)
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             # If internal executor error is raised, shutdown the server
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
+            self.metrics.track_error(type(e).__name__)
             return self.create_error_response(str(e))
 
     async def openai_completion(self, request: CompletionRequest, raw_request: Request) -> Response:
+        start_time = time.time()
+        self.metrics.track_request("completions")
 
         def merge_promises(
             promises: List[RequestOutput],
@@ -452,20 +460,27 @@ class OpenAIServer:
             else:
                 response = await create_completion_response(
                     generator)
+                self.metrics.track_latency("completions", start_time)
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             # If internal executor error is raised, shutdown the server
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
+            self.metrics.track_error(type(e).__name__)
             traceback.print_exc()
             return self.create_error_response(str(e))
 
     async def __call__(self, host, port):
+        # Start Prometheus metrics server
+        self.prometheus_server.start()
+        
         # Store the binding address for server registration
         self.binding_addr = f"http://{host}:{port}"
+        
         config = uvicorn.Config(self.app,
-                                host=host,
-                                port=port,
-                                log_level="info",
-                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
-        await uvicorn.Server(config).serve()
+                               host=host,
+                               port=port,
+                               log_level="info",
+                               timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+        server = uvicorn.Server(config)
+        await server.serve()

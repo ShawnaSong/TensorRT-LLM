@@ -49,7 +49,7 @@ class ToolCallManager:
         """Auto-detect the best parser for the given text format."""
         
         # Try parsers in order of specificity
-        parser_names = ["deepseek_v3", "hermes", "mistral", "qwen", "llama"]
+        parser_names = ["deepseek", "hermes", "mistral", "qwen", "llama"]
         
         for parser_name in parser_names:
             try:
