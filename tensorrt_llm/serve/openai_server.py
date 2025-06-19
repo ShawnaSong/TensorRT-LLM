@@ -234,10 +234,45 @@ class OpenAIServer:
                 promise: RequestOutput, postproc_params: PostprocParams) -> AsyncGenerator[str, None]:
             if not self.postproc_worker_enabled:
                 post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+            
+            first_token_time = None
+            token_count = 0
+            
             async for res in promise:
                 pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
                 for pp_res in pp_results:
+                    # Track time to first token
+                    if first_token_time is None:
+                        first_token_time = time.time()
+                        ttft = first_token_time - start_time
+                        self.metrics.track_time_to_first_token(ttft)
+                    
+                    token_count += 1
                     yield pp_res
+            
+            # Track final metrics for streaming
+            if token_count > 0:
+                end_time = time.time()
+                latency = end_time - start_time
+                prompt_tokens = len(promise.prompt_token_ids) if promise.prompt_token_ids else 0
+                
+                # Track token counts
+                self.metrics.track_tokens(prompt_tokens, token_count)
+                
+                # Track latency and success
+                self.metrics.track_latency("chat/completions", start_time)
+                self.metrics.track_success("stop")
+                
+                # Track throughput
+                if latency > 0:
+                    throughput = token_count / latency
+                    self.metrics.track_throughput(throughput)
+                
+                # Track time per token
+                if token_count > 1 and first_token_time:
+                    time_per_token = (end_time - first_token_time) / (token_count - 1)
+                    self.metrics.track_time_per_token(time_per_token)
+            
             yield "data: [DONE]\n\n"
             nvtx_mark("generation ends")
 
@@ -333,6 +368,12 @@ class OpenAIServer:
                                          media_type="text/event-stream")
             else:
                 response = await create_chat_response(promise, postproc_params)
+                
+                # Track token counts
+                prompt_tokens = len(promise.prompt_token_ids) if promise.prompt_token_ids else 0
+                generation_tokens = response.usage.completion_tokens if response.usage else 0
+                self.metrics.track_tokens(prompt_tokens, generation_tokens)
+                
                 self.metrics.track_latency("chat/completions", start_time)
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
@@ -373,14 +414,53 @@ class OpenAIServer:
 
         async def create_completion_generator(
                 generator: AsyncIterator[Tuple[RequestOutput, Optional[PostprocParams]]]):
+            first_token_time = None
+            total_tokens = 0
+            total_prompt_tokens = 0
+            
             async for request_output, postproc_params in generator:
                 if not self.postproc_worker_enabled:
                     post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
                     pp_result = post_processor(request_output, args)
                 else:
                     pp_result = request_output.outputs[0]._postprocess_result
+                
+                # Track time to first token
+                if first_token_time is None:
+                    first_token_time = time.time()
+                    ttft = first_token_time - start_time
+                    self.metrics.track_time_to_first_token(ttft)
+                
+                # Track prompt tokens
+                if request_output.prompt_token_ids:
+                    total_prompt_tokens += len(request_output.prompt_token_ids)
+                
                 for pp_res in pp_result:
+                    total_tokens += 1
                     yield pp_res
+            
+            # Track final metrics for streaming completion
+            if total_tokens > 0:
+                end_time = time.time()
+                latency = end_time - start_time
+                
+                # Track token counts
+                self.metrics.track_tokens(total_prompt_tokens, total_tokens)
+                
+                # Track latency and success
+                self.metrics.track_latency("completions", start_time)
+                self.metrics.track_success("stop")
+                
+                # Track throughput
+                if latency > 0:
+                    throughput = total_tokens / latency
+                    self.metrics.track_throughput(throughput)
+                
+                # Track time per token
+                if total_tokens > 1 and first_token_time:
+                    time_per_token = (end_time - first_token_time) / (total_tokens - 1)
+                    self.metrics.track_time_per_token(time_per_token)
+            
             yield "data: [DONE]\n\n"
 
         async def create_completion_response(
@@ -460,6 +540,12 @@ class OpenAIServer:
             else:
                 response = await create_completion_response(
                     generator)
+                
+                # Track token counts
+                total_prompt_tokens = response.usage.prompt_tokens if response.usage else 0
+                total_generation_tokens = response.usage.completion_tokens if response.usage else 0
+                self.metrics.track_tokens(total_prompt_tokens, total_generation_tokens)
+                
                 self.metrics.track_latency("completions", start_time)
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
@@ -478,9 +564,8 @@ class OpenAIServer:
         self.binding_addr = f"http://{host}:{port}"
         
         config = uvicorn.Config(self.app,
-                               host=host,
-                               port=port,
-                               log_level="info",
-                               timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
-        server = uvicorn.Server(config)
-        await server.serve()
+                                host=host,
+                                port=port,
+                                log_level="info",
+                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+        await uvicorn.Server(config).serve()
