@@ -369,8 +369,17 @@ class OpenAIServer:
             else:
                 response = await create_chat_response(promise, postproc_params)
                 
-                # Track token counts
-                prompt_tokens = len(promise.prompt_token_ids) if promise.prompt_token_ids else 0
+                # Track token counts - try different approaches
+                if response.usage and response.usage.prompt_tokens > 0:
+                    prompt_tokens = response.usage.prompt_tokens
+                else:
+                    # Fallback: calculate tokens from current request
+                    try:
+                        current_prompt = request.messages[-1].get('content', '') if request.messages else ''
+                        prompt_tokens = len(self.tokenizer.encode(current_prompt)) if current_prompt else 0
+                    except:
+                        prompt_tokens = 0
+                
                 generation_tokens = response.usage.completion_tokens if response.usage else 0
                 self.metrics.track_tokens(prompt_tokens, generation_tokens)
                 

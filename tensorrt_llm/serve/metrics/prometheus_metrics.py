@@ -282,10 +282,6 @@ class MetricsMiddleware:
         self._request_stats['latencies'].append(latency)
         current_running = self.metrics.gauge_scheduler_running.labels(model=self.model_name)._value.get()
         self.metrics.gauge_scheduler_running.labels(model=self.model_name).set(max(0, current_running - 1))
-        
-        # Log metrics periodically
-        if len(self._request_stats['latencies']) >= 10:  # Log every 10 requests
-            self._log_metrics()
 
     def track_tokens(self, prompt_tokens, generation_tokens):
         """Track token counts."""
@@ -293,8 +289,6 @@ class MetricsMiddleware:
         if prompt_tokens > 0:
             # Update the original prompt_tokens_total counter using existing metrics instance
             self.metrics.counter_prompt_tokens.labels(model=self.model_name).inc(prompt_tokens)
-            
-            # Update the request_prompt_tokens histogram
             self.metrics.histogram_num_prompt_tokens_request.labels(model=self.model_name).observe(prompt_tokens)
             
             # Also store for Metrics class batch logging
@@ -303,16 +297,11 @@ class MetricsMiddleware:
         if generation_tokens > 0:
             # Update the original generation_tokens_total counter using existing metrics instance
             self.metrics.counter_generation_tokens.labels(model=self.model_name).inc(generation_tokens)
-            
-            # Update the request_generation_tokens histogram
             self.metrics.histogram_num_generation_tokens_request.labels(model=self.model_name).observe(generation_tokens)
             
             # Also store for Metrics class batch logging
             self._request_stats['generation_tokens'].append(generation_tokens)
-        
-        # Force log metrics if we have accumulated enough data
-        if len(self._request_stats['prompt_tokens']) + len(self._request_stats['generation_tokens']) >= 5:
-            self._log_metrics()
+    
 
     def track_time_to_first_token(self, ttft):
         """Track time to first token."""
