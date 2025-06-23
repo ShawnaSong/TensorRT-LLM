@@ -16,25 +16,13 @@ from .metrics import (
     get_throughput
 )
 
-from .collector import (
-    MetricsCollector,
+from .engine_metrics_collector import (
+    EngineMetricsCollector,
     EngineStats
 )
 
-from .prometheus_metrics import (
-    MetricsMiddleware,
-    REQUEST_COUNT,
-    REQUEST_LATENCY,
-    TOOL_CALL_COUNT,
-    TOOL_CALL_LATENCY,
-    ACTIVE_REQUESTS,
-    ERROR_COUNT,
-    TOKEN_THROUGHPUT,
-    GPU_MEMORY_USAGE,
-    CPU_MEMORY_USAGE,
-    GPU_CACHE_USAGE,
-    SPEC_DECODE_ACCEPTANCE_RATE,
-    SPEC_DECODE_EFFICIENCY
+from .metrics_types import (
+    TensorRTMetrics
 )
 
 __all__ = [
@@ -45,30 +33,16 @@ __all__ = [
     "LoggingStatLogger",
     "PrometheusStatLogger",
     
-    # Collector and engine stats
-    "MetricsCollector",
+    # Engine metrics collector
+    "EngineMetricsCollector",
     "EngineStats",
     
-    # Middleware and utilities
-    "MetricsMiddleware",
+    # TensorRT metrics interface
+    "TensorRTMetrics",
     
     # Utility functions
     "build_1_2_5_buckets",
     "build_1_2_3_5_8_buckets", 
     "local_interval_elapsed",
-    "get_throughput",
-    
-    # Prometheus metrics
-    "REQUEST_COUNT",
-    "REQUEST_LATENCY", 
-    "TOOL_CALL_COUNT",
-    "TOOL_CALL_LATENCY",
-    "ACTIVE_REQUESTS",
-    "ERROR_COUNT",
-    "TOKEN_THROUGHPUT",
-    "GPU_MEMORY_USAGE",
-    "CPU_MEMORY_USAGE",
-    "GPU_CACHE_USAGE",
-    "SPEC_DECODE_ACCEPTANCE_RATE",
-    "SPEC_DECODE_EFFICIENCY"
+    "get_throughput"
 ] 
