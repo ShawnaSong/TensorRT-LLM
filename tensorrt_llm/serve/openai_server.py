@@ -2,6 +2,7 @@
 import asyncio
 import signal
 import traceback
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
@@ -40,6 +41,9 @@ from tensorrt_llm.serve.postprocess_handlers import (
     completion_stream_post_processor)
 from tensorrt_llm.serve.tool_call_manager import ToolCallManager
 from tensorrt_llm.version import __version__ as VERSION
+from tensorrt_llm.metrics.loggers import PrometheusStatLogger
+from tensorrt_llm.metrics.collector import Stats
+from tensorrt_llm.metrics.prometheus_server import PrometheusServer
 
 from .._utils import nvtx_mark
 
@@ -54,7 +58,8 @@ class OpenAIServer:
                  model: str,
                  tool_parser: str,
                  server_role: Optional[ServerRole],
-                 metadata_server_cfg: MetadataServerConfig):
+                 metadata_server_cfg: MetadataServerConfig,
+                 prometheus_port: int = 18002):
         self.llm = llm
         self.tokenizer = llm.tokenizer
         self.metadata_server = create_metadata_server(metadata_server_cfg)
@@ -82,6 +87,15 @@ class OpenAIServer:
             self.model = model_dir.name
         else:
             self.model = model
+
+        self.prometheus_server = PrometheusServer(port=prometheus_port)
+
+        # Initialize Prometheus metrics logger for API layer
+        self.prometheus_logger = PrometheusStatLogger(
+            local_interval=10.0,
+            labels={"source": "api", "model": self.model},
+            max_model_len=8192
+        )
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
@@ -218,6 +232,14 @@ class OpenAIServer:
         return JSONResponse(content=events)
 
     async def openai_chat(self, request: ChatCompletionRequest, raw_request: Request) -> Response:
+        http_start = time.time()  # Record HTTP request start time for TTFT
+        first_token_time = None
+        last_token_time = None
+        token_count = 0
+        ttft_logged = False
+        tpot_logged = False
+        ttft = None
+        tpot = None
 
         def get_role() -> str:
             if request.add_generation_prompt:
@@ -228,12 +250,28 @@ class OpenAIServer:
 
         async def chat_stream_generator(
                 promise: RequestOutput, postproc_params: PostprocParams) -> AsyncGenerator[str, None]:
+            nonlocal first_token_time, last_token_time, token_count, ttft_logged, tpot_logged, ttft, tpot
             if not self.postproc_worker_enabled:
                 post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+            i = 0
             async for res in promise:
+                now = time.time()
+                if i == 0:
+                    first_token_time = now
+                    ttft = first_token_time - http_start
+                    ttft_logged = True
+                last_token_time = now
+                token_count += 1
+                i += 1
                 pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
                 for pp_res in pp_results:
                     yield pp_res
+            # After all tokens are generated, compute and log TPOT
+            if token_count > 1 and first_token_time is not None and last_token_time is not None and not tpot_logged:
+                tpot = (last_token_time - first_token_time) / (token_count - 1)
+                # tpot = (last_token_time - first_token_time)
+                # self.log_ttft_tpot(ttft=None, tpot=tpot)
+                tpot_logged = True
             yield "data: [DONE]\n\n"
             nvtx_mark("generation ends")
 
@@ -325,11 +363,62 @@ class OpenAIServer:
 
             if request.stream:
                 response_generator = chat_stream_generator(promise, postproc_params)
-                return StreamingResponse(content=response_generator,
-                                         media_type="text/event-stream")
+                response = StreamingResponse(content=response_generator,
+                                             media_type="text/event-stream")
             else:
                 response = await create_chat_response(promise, postproc_params)
-                return JSONResponse(content=response.model_dump())
+                response = JSONResponse(content=response.model_dump())
+            # Metrics: collect HTTP-level latency and tokens
+            http_end = time.time()
+            num_prompt_tokens = len(promise.prompt_token_ids) if hasattr(promise, 'prompt_token_ids') else 0
+            num_gen_tokens = 0
+            if not request.stream and hasattr(response, 'body'):
+                # Try to parse tokens from response if possible
+                try:
+                    import json
+                    body = response.body if isinstance(response.body, str) else response.body.decode()
+                    data = json.loads(body)
+                    usage = data.get('usage', {})
+                    num_gen_tokens = usage.get('completion_tokens', 0)
+                except Exception:
+                    pass
+            stats = Stats(
+                now=http_end,
+                num_running_sys=1,
+                num_waiting_sys=0,
+                num_swapped_sys=0,
+                gpu_cache_usage_sys=0.0,
+                cpu_cache_usage_sys=0.0,
+                gpu_memory_usage_sys=0.0,
+                cpu_memory_usage_sys=0.0,
+                gpu_prefix_cache_hit_rate=0.0,
+                cpu_prefix_cache_hit_rate=0.0,
+                running_lora_adapters=[],
+                waiting_lora_adapters=[],
+                max_lora=0,
+                num_preemption_iter=0,
+                num_prompt_tokens_iter=num_prompt_tokens,
+                num_generation_tokens_iter=num_gen_tokens,
+                num_tokens_iter=num_prompt_tokens + num_gen_tokens,
+                time_to_first_tokens_iter=[],
+                time_per_output_tokens_iter=[],
+                time_e2e_requests=[http_end - http_start],
+                time_queue_requests=[],
+                time_inference_requests=[],
+                time_prefill_requests=[],
+                time_decode_requests=[],
+                num_prompt_tokens_requests=[num_prompt_tokens],
+                num_generation_tokens_requests=[num_gen_tokens],
+                n_requests=[1],
+                max_num_generation_tokens_requests=[num_gen_tokens],
+                max_tokens_requests=[num_gen_tokens],
+                finished_reason_requests=["stop"],
+                spec_decode_metrics=None,
+                tool_calls_iter=None,
+                tool_call_errors_iter=None
+            )
+            self.prometheus_logger.log(stats)
+            return response
         except CppExecutorError:
             # If internal executor error is raised, shutdown the server
             signal.raise_signal(signal.SIGINT)
@@ -337,7 +426,8 @@ class OpenAIServer:
             return self.create_error_response(str(e))
 
     async def openai_completion(self, request: CompletionRequest, raw_request: Request) -> Response:
-
+        import time
+        http_start = time.time()
         def merge_promises(
             promises: List[RequestOutput],
             postproc_params_collections: List[Optional[PostprocParams]]
@@ -380,6 +470,7 @@ class OpenAIServer:
             all_choices: List[CompletionResponseChoice] = []
             all_prompt_token_ids: List[List[int]] = []
             num_prompt_tokens = num_gen_tokens = 0
+            start_time = time.time()
             async for request_output, postproc_params in generator:
                 pp_result: CompletionResponse
                 if not self.postproc_worker_enabled:
@@ -405,6 +496,45 @@ class OpenAIServer:
                 usage=usage_info,
                 prompt_token_ids=all_prompt_token_ids,
             )
+            # --- Prometheus metrics logging ---
+            end_time = time.time()
+            stats = Stats(
+                now=end_time,
+                num_running_sys=1,
+                num_waiting_sys=0,
+                num_swapped_sys=0,
+                gpu_cache_usage_sys=0.0,
+                cpu_cache_usage_sys=0.0,
+                gpu_memory_usage_sys=0.0,
+                cpu_memory_usage_sys=0.0,
+                gpu_prefix_cache_hit_rate=0.0,
+                cpu_prefix_cache_hit_rate=0.0,
+                running_lora_adapters=[],
+                waiting_lora_adapters=[],
+                max_lora=0,
+                num_preemption_iter=0,
+                num_prompt_tokens_iter=num_prompt_tokens,
+                num_generation_tokens_iter=num_gen_tokens,
+                num_tokens_iter=num_prompt_tokens + num_gen_tokens,
+                time_to_first_tokens_iter=[],
+                time_per_output_tokens_iter=[],
+                time_e2e_requests=[end_time - start_time],
+                time_queue_requests=[],
+                time_inference_requests=[],
+                time_prefill_requests=[],
+                time_decode_requests=[],
+                num_prompt_tokens_requests=[num_prompt_tokens],
+                num_generation_tokens_requests=[num_gen_tokens],
+                n_requests=[1],
+                max_num_generation_tokens_requests=[num_gen_tokens],
+                max_tokens_requests=[num_gen_tokens],
+                finished_reason_requests=["stop"],
+                spec_decode_metrics=None,
+                tool_calls_iter=None,
+                tool_call_errors_iter=None
+            )
+            self.prometheus_logger.log(stats)
+            # --- End Prometheus metrics logging ---
             return response
 
         try:
@@ -462,6 +592,7 @@ class OpenAIServer:
 
     async def __call__(self, host, port):
         # Store the binding address for server registration
+        self.prometheus_server.start()
         self.binding_addr = f"http://{host}:{port}"
         config = uvicorn.Config(self.app,
                                 host=host,

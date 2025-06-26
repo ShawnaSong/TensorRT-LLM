@@ -134,7 +134,8 @@ def launch_server(host: str,
                   llm_args: dict,
                   tool_parser: str = None,
                   metadata_server_cfg: Optional[MetadataServerConfig] = None,
-                  server_role: Optional[ServerRole] = None):
+                  server_role: Optional[ServerRole] = None,
+                  prometheus_port: int = 18002):
 
     backend = llm_args["backend"]
     model = llm_args["model"]
@@ -148,7 +149,8 @@ def launch_server(host: str,
                           model=model,
                           tool_parser=tool_parser,
                           server_role=server_role,
-                          metadata_server_cfg=metadata_server_cfg)
+                          metadata_server_cfg=metadata_server_cfg,
+                          prometheus_port=prometheus_port)
 
     asyncio.run(server(host, port))
 
@@ -262,6 +264,12 @@ def launch_server(host: str,
     default=False,
     help="Whether to trust remote code.",
 )
+@click.option(
+    "--prometheus_port",
+    type=int,
+    default=18002, 
+    help="Prometheus port.",
+)
 def serve(model: str, tokenizer: Optional[str], host: str, port: int,
           log_level: str, backend: str, max_beam_width: int,
           max_batch_size: int, max_num_tokens: int, max_seq_len: int,
@@ -271,7 +279,7 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
           num_postprocess_workers: int, trust_remote_code: bool,
           extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
           tool_parser: str, metadata_server_config_file: Optional[str],
-          server_role: Optional[str]):
+          server_role: Optional[str],prometheus_port: str):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -312,7 +320,7 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
         except ValueError:
             raise ValueError(f"Invalid server role: {server_role}. " \
                              f"Must be one of: {', '.join([role.name for role in ServerRole])}")
-    launch_server(host, port, llm_args, tool_parser, metadata_server_cfg, server_role)
+    launch_server(host, port, llm_args, tool_parser, metadata_server_cfg, server_role, prometheus_port)
 
 
 def get_ctx_gen_server_urls(
