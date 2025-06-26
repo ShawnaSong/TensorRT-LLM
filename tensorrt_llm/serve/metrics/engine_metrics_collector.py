@@ -177,12 +177,11 @@ class EngineMetricsCollector:
         
         return request_stats
     
-    def track_request_start(self, request_id: str, prompt_tokens: int, max_tokens: int):
+    def track_request_start(self, request_id: str, max_tokens: int):
         """Track when a request starts processing."""
         now = time.time()
         self._request_timestamps[request_id] = now
         self._request_metrics[request_id] = {
-            'prompt_tokens': prompt_tokens,
             'max_tokens': max_tokens,
             'finished': False,
         }

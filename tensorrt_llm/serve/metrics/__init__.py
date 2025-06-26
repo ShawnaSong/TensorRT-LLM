@@ -18,7 +18,6 @@ from .metrics import (
 
 from .engine_metrics_collector import (
     EngineMetricsCollector,
-    EngineStats
 )
 
 from .metrics_types import (
@@ -35,7 +34,6 @@ __all__ = [
     
     # Engine metrics collector
     "EngineMetricsCollector",
-    "EngineStats",
     
     # TensorRT metrics interface
     "TensorRTMetrics",

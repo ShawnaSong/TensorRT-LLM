@@ -2,11 +2,10 @@
 import asyncio
 import signal
 import traceback
-import time
 from contextlib import asynccontextmanager
-from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
+import time
 from typing import AsyncGenerator, AsyncIterator, List, Optional, Tuple
 
 import uvicorn
@@ -21,12 +20,10 @@ from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import LLM
-from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig, ServerRole
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.chat_utils import (check_multiple_response,
                                            parse_chat_messages_coroutines)
-from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
                                                 CompletionRequest,
@@ -41,14 +38,16 @@ from tensorrt_llm.serve.postprocess_handlers import (
     completion_stream_post_processor)
 from tensorrt_llm.serve.tool_call_manager import ToolCallManager
 from tensorrt_llm.version import __version__ as VERSION
-from tensorrt_llm.metrics.loggers import PrometheusStatLogger
-from tensorrt_llm.metrics.collector import Stats
-from tensorrt_llm.metrics.prometheus_server import PrometheusServer
+from tensorrt_llm.serve.metrics import TensorRTMetrics
+from tensorrt_llm.serve.metrics.prometheus_server import PrometheusServer
 
 from .._utils import nvtx_mark
 
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
+
+import os
+ERROR_LOG_PATH = os.path.expanduser('~/.cache/trtllm-error.log')
 
 
 class OpenAIServer:
@@ -57,29 +56,28 @@ class OpenAIServer:
                  llm: LLM,
                  model: str,
                  tool_parser: str,
-                 server_role: Optional[ServerRole],
-                 metadata_server_cfg: MetadataServerConfig,
-                 prometheus_port: int = 18002):
+                 server_role: Optional["ServerRole"],
+                 metadata_server_cfg: "MetadataServerConfig",
+                 prometheus_port: int = None):
         self.llm = llm
         self.tokenizer = llm.tokenizer
-        self.metadata_server = create_metadata_server(metadata_server_cfg)
+        #self.metadata_server = create_metadata_server(metadata_server_cfg)
         self.server_role = server_role
         self.binding_addr = None  # Will be set in __call__
         self.tool_parser = tool_parser
-        
+        self.metrics = TensorRTMetrics(model_name=model, llm=llm)
+        self.prometheus_server = PrometheusServer(port=prometheus_port) if prometheus_port else None
+
         # Initialize tool call manager
         self.tool_call_manager = ToolCallManager(self.tokenizer, self.tool_parser)
         hf_tokenizer_path = llm._hf_model_dir or self.tokenizer.tokenizer.name_or_path
         trust_remote_code = llm.args.trust_remote_code
         try:
             self.processor = AutoProcessor.from_pretrained(hf_tokenizer_path, trust_remote_code=trust_remote_code)
+            self.model_config = AutoConfig.from_pretrained(hf_tokenizer_path)
         except Exception:
             logger.debug("Failed to load AutoProcessor or AutoConfig for %s", hf_tokenizer_path)
             self.processor = None
-        try:
-            self.model_config = AutoConfig.from_pretrained(hf_tokenizer_path)
-        except Exception:
-            logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
             self.model_config = None
 
         model_dir = Path(model)
@@ -88,36 +86,10 @@ class OpenAIServer:
         else:
             self.model = model
 
-        self.prometheus_server = PrometheusServer(port=prometheus_port)
-
-        # Initialize Prometheus metrics logger for API layer
-        self.prometheus_logger = PrometheusStatLogger(
-            local_interval=10.0,
-            labels={"source": "api", "model": self.model},
-            max_model_len=8192
-        )
-
         @asynccontextmanager
         async def lifespan(app: FastAPI):
-            if self.metadata_server is not None:
-                metadata = {
-                    "model": self.model,
-                    "version": VERSION,
-                    "timestamp": datetime.now().isoformat(),
-                    "server_role": server_role.name,
-                    "url": self.binding_addr
-                }
-                # TODO: add more metadata
-                # Register with ETCD using the existing key format
-                self.metadata_server.put(f"trtllm/{self.llm.llm_id}", metadata)
-                logger.info(f"trtllm/{self.llm.llm_id} is registered")
-
             # terminate rank0 worker
             yield
-
-            if self.metadata_server is not None:
-                self.metadata_server.remove(f"trtllm/{self.llm.llm_id}")
-                logger.info(f"trtllm/{self.llm.llm_id} is unregistered")
             self.llm.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
@@ -128,15 +100,23 @@ class OpenAIServer:
 
         self.register_routes()
 
+        self.last_yield_time = time.time()
+
+        # Delete error log file if it exists
+        if os.path.exists(ERROR_LOG_PATH):
+            try:
+                os.remove(ERROR_LOG_PATH)
+            except Exception as e:
+                pass
+
     async def await_disconnected(self, raw_request: Request, promise):
-        if raw_request is None:
-            return
         while not await raw_request.is_disconnected():
             await asyncio.sleep(1)
         if not promise.finished:
             promise.abort()
             logger.info(
                 f"{raw_request.client} is disconnected, abort {promise.request_id}")
+            self.metrics.track_request_completion(promise.request_id, finish_reason="disconnected")
 
     @property
     def postproc_worker_enabled(self) -> bool:
@@ -156,7 +136,6 @@ class OpenAIServer:
 
     def register_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
-        self.app.add_api_route("/health_generate", self.health_generate, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
@@ -171,41 +150,36 @@ class OpenAIServer:
                                methods=["POST"])
 
     async def health(self) -> Response:
-        return Response(status_code=200)
+        # check error log
+        if os.path.exists(ERROR_LOG_PATH):
+            mtime = os.path.getmtime(ERROR_LOG_PATH)
+            if time.time() - mtime < 300:
+                with open(ERROR_LOG_PATH, "r") as f:
+                    lines = f.readlines()
+                    last_line = lines[-1].strip() if lines else ""
+                    logger.warning(f'Fatal error from worker detected: {last_line}', )
+                return Response(content=last_line, status_code=500)
 
-    async def health_generate(self) -> Response:
-        """Health check that performs a minimal generation."""
-        try:
-            # Create a minimal chat request
-            health_request = ChatCompletionRequest(
-                messages=[{"role": "user", "content": "hi"}], # Minimal prompt (often > 1 token after tokenization)
-                model=self.model,
-                max_completion_tokens=1, # Request only 1 token out
-                stream=False,
-                temperature=0.0 # Deterministic output
-            )
+        # Check for pending requests and yield timeout
+        waiting_time = 0
+        active_requests = self.metrics._active_requests
+        if active_requests > 0:
+            waiting_time = time.time() - self.last_yield_time
+            if waiting_time > 60:
+                logger.error(f"Critical timeout, pending requests: {active_requests}, waiting timeout: {waiting_time}.")
 
-            mock_request = None
-
-            # Call the chat completion logic
-            response = await self.openai_chat(health_request, mock_request)
-
-            # Check if the response indicates success (status code 200)
-            if response.status_code == 200:
-                return Response(status_code=200, content="Generation health check OK")
+                time.sleep(1)
+                os._exit(-1)
+            elif active_requests > 1 and waiting_time > 1:
+                logger.warning(f"Pending requests: {active_requests}, waiting timeout: {waiting_time}.")
+                return Response(
+                    content=f"Pending request timeout, {waiting_time} seconds.",
+                    status_code=500,
+                )
             else:
-                logger.error(f"Health generate check failed with status code: {response.status_code}")
-                try:
-                    # Attempt to get body for more details if possible
-                    body = response.body if hasattr(response, 'body') else await response.body()
-                    logger.error(f"Health generate check response body: {body}")
-                except Exception:
-                    pass # Ignore errors trying to get body details
-                return Response(status_code=500, content="Generation health check failed")
+                logger.info(f"Pending requests: {active_requests}, waiting time: {waiting_time} seconds.")
 
-        except Exception as e:
-            logger.error(f"Health generate check encountered exception: {e}", exc_info=True)
-            return Response(status_code=500, content=f"Generation health check failed: {str(e)}")
+        return Response(status_code=200)
 
     async def version(self) -> JSONResponse:
         ver = {"version": VERSION}
@@ -232,14 +206,6 @@ class OpenAIServer:
         return JSONResponse(content=events)
 
     async def openai_chat(self, request: ChatCompletionRequest, raw_request: Request) -> Response:
-        http_start = time.time()  # Record HTTP request start time for TTFT
-        first_token_time = None
-        last_token_time = None
-        token_count = 0
-        ttft_logged = False
-        tpot_logged = False
-        ttft = None
-        tpot = None
 
         def get_role() -> str:
             if request.add_generation_prompt:
@@ -250,39 +216,52 @@ class OpenAIServer:
 
         async def chat_stream_generator(
                 promise: RequestOutput, postproc_params: PostprocParams) -> AsyncGenerator[str, None]:
-            nonlocal first_token_time, last_token_time, token_count, ttft_logged, tpot_logged, ttft, tpot
             if not self.postproc_worker_enabled:
                 post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-            i = 0
+
+            prompt_tokens_len = len(promise.prompt_token_ids)
+            logger.info(f">> {prompt_tokens_len=}")
+
+            self.metrics.track_first_token(request_id)
+            token_count = 0
+
             async for res in promise:
-                now = time.time()
-                if i == 0:
-                    first_token_time = now
-                    ttft = first_token_time - http_start
-                    ttft_logged = True
-                last_token_time = now
-                token_count += 1
-                i += 1
                 pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
                 for pp_res in pp_results:
+                    self.metrics.track_token_generation(request_id, len(promise.outputs[0].token_ids))
                     yield pp_res
-            # After all tokens are generated, compute and log TPOT
-            if token_count > 1 and first_token_time is not None and last_token_time is not None and not tpot_logged:
-                tpot = (last_token_time - first_token_time) / (token_count - 1)
-                # tpot = (last_token_time - first_token_time)
-                # self.log_ttft_tpot(ttft=None, tpot=tpot)
-                tpot_logged = True
-            yield "data: [DONE]\n\n"
+                    self.last_yield_time = time.time()
+
+            finish_reason = "stop"
+            if promise.outputs:
+                finish_reason = promise.outputs[0].finish_reason or "stop"
+            self.metrics.track_request_completion(request_id,
+                                                  prompt_tokens=len(promise.prompt_token_ids),
+                                                  generation_tokens=token_count,
+                                                  finish_reason=finish_reason)
+
+            yield f"data: [DONE]\n\n"
             nvtx_mark("generation ends")
+
+            logger.info(f"<< {prompt_tokens_len}:{token_count}")
 
         async def create_chat_response(
                 promise: RequestOutput, postproc_params: PostprocParams) -> ChatCompletionResponse:
             await promise.aresult()
             if self.postproc_worker_enabled:
-                chat_response =promise.outputs[0]._postprocess_result
+                return promise.outputs[0]._postprocess_result
             else:
                 post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
                 chat_response = post_processor(promise, args)
+
+            chat_response.prompt_token_ids = promise.prompt_token_ids
+            finish_reason = "stop"
+            if chat_response.choices:
+                finish_reason = chat_response.choices[0].finish_reason or "stop"
+            self.metrics.track_request_completion(request_id,
+                                                  prompt_tokens=chat_response.usage.prompt_tokens,
+                                                  generation_tokens=chat_response.usage.completion_tokens,
+                                                  finish_reason=finish_reason)
 
             # Process tool calls if tools are available and no tool calls were found
             if (request.tools and len(request.tools) > 0 and 
@@ -303,11 +282,10 @@ class OpenAIServer:
                             logger.warning(f"Tool call extraction failed: {e}")
 
             # Add prompt_tokens_ids to the response
-            chat_response.prompt_token_ids = promise.prompt_token_ids
+            #chat_response.prompt_token_ids = promise.prompt_token_ids
             return chat_response
 
         try:
-            check_multiple_response(request.n, self.llm.args.backend)
             conversation: List[ConversationMessage] = []
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
@@ -356,6 +334,8 @@ class OpenAIServer:
                 streaming=request.stream,
                 disaggregated_params=disaggregated_params
             )
+            request_id = promise.request_id
+            self.metrics.track_request_start(promise.request_id, request.max_completion_tokens)
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
                 postproc_args.tokenizer = self.tokenizer
@@ -363,71 +343,23 @@ class OpenAIServer:
 
             if request.stream:
                 response_generator = chat_stream_generator(promise, postproc_params)
-                response = StreamingResponse(content=response_generator,
-                                             media_type="text/event-stream")
+                return StreamingResponse(content=response_generator,
+                                         media_type="text/event-stream")
             else:
                 response = await create_chat_response(promise, postproc_params)
-                response = JSONResponse(content=response.model_dump())
-            # Metrics: collect HTTP-level latency and tokens
-            http_end = time.time()
-            num_prompt_tokens = len(promise.prompt_token_ids) if hasattr(promise, 'prompt_token_ids') else 0
-            num_gen_tokens = 0
-            if not request.stream and hasattr(response, 'body'):
-                # Try to parse tokens from response if possible
-                try:
-                    import json
-                    body = response.body if isinstance(response.body, str) else response.body.decode()
-                    data = json.loads(body)
-                    usage = data.get('usage', {})
-                    num_gen_tokens = usage.get('completion_tokens', 0)
-                except Exception:
-                    pass
-            stats = Stats(
-                now=http_end,
-                num_running_sys=1,
-                num_waiting_sys=0,
-                num_swapped_sys=0,
-                gpu_cache_usage_sys=0.0,
-                cpu_cache_usage_sys=0.0,
-                gpu_memory_usage_sys=0.0,
-                cpu_memory_usage_sys=0.0,
-                gpu_prefix_cache_hit_rate=0.0,
-                cpu_prefix_cache_hit_rate=0.0,
-                running_lora_adapters=[],
-                waiting_lora_adapters=[],
-                max_lora=0,
-                num_preemption_iter=0,
-                num_prompt_tokens_iter=num_prompt_tokens,
-                num_generation_tokens_iter=num_gen_tokens,
-                num_tokens_iter=num_prompt_tokens + num_gen_tokens,
-                time_to_first_tokens_iter=[],
-                time_per_output_tokens_iter=[],
-                time_e2e_requests=[http_end - http_start],
-                time_queue_requests=[],
-                time_inference_requests=[],
-                time_prefill_requests=[],
-                time_decode_requests=[],
-                num_prompt_tokens_requests=[num_prompt_tokens],
-                num_generation_tokens_requests=[num_gen_tokens],
-                n_requests=[1],
-                max_num_generation_tokens_requests=[num_gen_tokens],
-                max_tokens_requests=[num_gen_tokens],
-                finished_reason_requests=["stop"],
-                spec_decode_metrics=None,
-                tool_calls_iter=None,
-                tool_call_errors_iter=None
-            )
-            self.prometheus_logger.log(stats)
-            return response
-        except CppExecutorError:
+                return JSONResponse(content=response.model_dump())
+        except CppExecutorError as e:
             # If internal executor error is raised, shutdown the server
+            self.metrics.track_error(request_id, "CppExecutorError")
             signal.raise_signal(signal.SIGINT)
+            raise e
         except Exception as e:
+            self.metrics.track_error(request_id, type(e).__name__)
+            traceback.print_exc()
             return self.create_error_response(str(e))
 
     async def openai_completion(self, request: CompletionRequest, raw_request: Request) -> Response:
-        import time
-        http_start = time.time()
+
         def merge_promises(
             promises: List[RequestOutput],
             postproc_params_collections: List[Optional[PostprocParams]]
@@ -453,24 +385,33 @@ class OpenAIServer:
 
             return consumer()
 
+        generate_length_recorder = {}
+        prompt_length_recorder = {}
         async def create_completion_generator(
                 generator: AsyncIterator[Tuple[RequestOutput, Optional[PostprocParams]]]):
+            total_tokens = 0
+            prompt_length_recorder = {}
             async for request_output, postproc_params in generator:
+                rid = request_output.request_id
+                prompt_length_recorder[rid] = len(request_output.prompt_token_ids)
+                generate_length_recorder[rid] = len(request_output.outputs[0].token_ids)
                 if not self.postproc_worker_enabled:
                     post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
                     pp_result = post_processor(request_output, args)
                 else:
                     pp_result = request_output.outputs[0]._postprocess_result
                 for pp_res in pp_result:
+                    # total_tokens += 1	# TODO: plus 1 is wrong for speculative decoding
                     yield pp_res
-            yield "data: [DONE]\n\n"
-
+                    self.last_yield_time = time.time()
+			# TODO: merge num_gen_tokens?
+            for rid in generate_length_recorder.keys():
+               self.metrics.track_request_completion(rid, prompt_tokens=prompt_length_recorder[rid], generation_tokens=generate_length_recorder[rid], finish_reason="stop")
+            yield f"data: [DONE]\n\n"
         async def create_completion_response(
                 generator: AsyncIterator[Tuple[RequestOutput, Optional[PostprocParams]]]) -> CompletionResponse:
             all_choices: List[CompletionResponseChoice] = []
-            all_prompt_token_ids: List[List[int]] = []
             num_prompt_tokens = num_gen_tokens = 0
-            start_time = time.time()
             async for request_output, postproc_params in generator:
                 pp_result: CompletionResponse
                 if not self.postproc_worker_enabled:
@@ -479,11 +420,13 @@ class OpenAIServer:
                 else:
                     pp_result = request_output.outputs[0]._postprocess_result
 
+                rid = request_output.request_id
+                generate_length_recorder[rid] = len(request_output.outputs[0].token_ids)
+
                 choices, usage = pp_result.choices, pp_result.usage
                 all_choices.extend(choices)
                 num_prompt_tokens += usage.prompt_tokens
                 num_gen_tokens += usage.completion_tokens
-                all_prompt_token_ids.append(request_output.prompt_token_ids)
 
             usage_info = UsageInfo(
                 prompt_tokens=num_prompt_tokens,
@@ -494,51 +437,18 @@ class OpenAIServer:
                 model=self.model,
                 choices=all_choices,
                 usage=usage_info,
-                prompt_token_ids=all_prompt_token_ids,
             )
-            # --- Prometheus metrics logging ---
-            end_time = time.time()
-            stats = Stats(
-                now=end_time,
-                num_running_sys=1,
-                num_waiting_sys=0,
-                num_swapped_sys=0,
-                gpu_cache_usage_sys=0.0,
-                cpu_cache_usage_sys=0.0,
-                gpu_memory_usage_sys=0.0,
-                cpu_memory_usage_sys=0.0,
-                gpu_prefix_cache_hit_rate=0.0,
-                cpu_prefix_cache_hit_rate=0.0,
-                running_lora_adapters=[],
-                waiting_lora_adapters=[],
-                max_lora=0,
-                num_preemption_iter=0,
-                num_prompt_tokens_iter=num_prompt_tokens,
-                num_generation_tokens_iter=num_gen_tokens,
-                num_tokens_iter=num_prompt_tokens + num_gen_tokens,
-                time_to_first_tokens_iter=[],
-                time_per_output_tokens_iter=[],
-                time_e2e_requests=[end_time - start_time],
-                time_queue_requests=[],
-                time_inference_requests=[],
-                time_prefill_requests=[],
-                time_decode_requests=[],
-                num_prompt_tokens_requests=[num_prompt_tokens],
-                num_generation_tokens_requests=[num_gen_tokens],
-                n_requests=[1],
-                max_num_generation_tokens_requests=[num_gen_tokens],
-                max_tokens_requests=[num_gen_tokens],
-                finished_reason_requests=["stop"],
-                spec_decode_metrics=None,
-                tool_calls_iter=None,
-                tool_call_errors_iter=None
-            )
-            self.prometheus_logger.log(stats)
-            # --- End Prometheus metrics logging ---
+			# TODO: merge num_gen_tokens?
+            for rid in generate_length_recorder.keys():
+               self.metrics.track_request_completion(
+                   rid,
+                   prompt_tokens=num_prompt_tokens,
+                   generation_tokens=num_gen_tokens,
+                   finish_reason="stop"
+               )
             return response
 
         try:
-            check_multiple_response(request.n, self.llm.args.backend)
             if isinstance(request.prompt, str) or \
                 (isinstance(request.prompt, list) and isinstance(request.prompt[0], int)):
                 prompts = [request.prompt]
@@ -566,6 +476,9 @@ class OpenAIServer:
                     streaming=request.stream,
                     disaggregated_params=disaggregated_params
                 )
+                # print(f"Request ID: {promise.request_id}, Prompt: {prompt}")
+                # # request_ids.append(promise.request_id)
+                self.metrics.track_request_start(promise.request_id, request.max_tokens)
                 asyncio.create_task(self.await_disconnected(raw_request, promise))
                 if not self.postproc_worker_enabled:
                     postproc_args.tokenizer = self.tokenizer
@@ -583,17 +496,22 @@ class OpenAIServer:
                 response = await create_completion_response(
                     generator)
                 return JSONResponse(content=response.model_dump())
-        except CppExecutorError:
+        except CppExecutorError as e:
             # If internal executor error is raised, shutdown the server
+            for request_id in generate_length_recorder.keys():
+                self.metrics.track_error(request_id, "CppExecutorError")
             signal.raise_signal(signal.SIGINT)
+            raise e
         except Exception as e:
+            for request_id in generate_length_recorder.keys():
+                self.metrics.track_error(request_id, type(e).__name__)
             traceback.print_exc()
             return self.create_error_response(str(e))
 
     async def __call__(self, host, port):
-        # Store the binding address for server registration
-        self.prometheus_server.start()
-        self.binding_addr = f"http://{host}:{port}"
+        if self.prometheus_server is not None:
+            self.prometheus_server.start()
+
         config = uvicorn.Config(self.app,
                                 host=host,
                                 port=port,
