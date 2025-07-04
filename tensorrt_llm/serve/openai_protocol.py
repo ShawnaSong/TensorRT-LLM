@@ -344,6 +344,13 @@ class CustomChatCompletionMessageParam(TypedDict, total=False):
     Provides the model information to differentiate between participants of the
     same role.
     """
+    
+    # Allow tool_calls and tool_call_id for tool messages
+    tool_calls: List[Dict[str, Any]]
+    """Tool calls for tool messages."""
+    
+    tool_call_id: str
+    """Tool call ID for tool messages."""
 
 
 ChatCompletionMessageParam = Union[OpenAIChatCompletionMessageParam,
