@@ -7,6 +7,7 @@ from .llama_tool_parser import LlamaToolParser
 from .qwen_tool_parser import QwenToolParser
 from .mistral_tool_parser import MistralToolParser
 from .deepseekv3_tool_parser import DeepSeekV3ToolParser
+from .kimik2_tool_parser import KimiK2ToolParser
 
 __all__ = [
     "ToolParser",
@@ -15,5 +16,6 @@ __all__ = [
     "LlamaToolParser",
     "QwenToolParser",
     "MistralToolParser",
-    "DeepSeekV3ToolParser"
+    "DeepSeekV3ToolParser",
+    "KimiK2ToolParser"
 ] 
