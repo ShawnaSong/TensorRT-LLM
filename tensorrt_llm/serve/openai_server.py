@@ -230,6 +230,10 @@ class OpenAIServer:
                 for pp_res in pp_results:
                     yield pp_res
             yield "data: [DONE]\n\n"
+            # Log decoding_iter and acceptance rate for streaming requests when generation ends
+            num_generated_tokens = len(promise.outputs[0].token_ids) if promise.outputs[0].token_ids else 0
+            acceptance_rate = num_generated_tokens / (promise.decoding_iter + 1) if promise.decoding_iter > 0 else 0.0
+            logger.info(f"Chat completion streaming request {promise.request_id} completed with decoding_iter: {promise.decoding_iter}, acceptance_rate: {acceptance_rate:.4f}")
             nvtx_mark("generation ends")
 
         async def create_chat_response(
@@ -308,6 +312,10 @@ class OpenAIServer:
                                          media_type="text/event-stream")
             else:
                 response = await create_chat_response(promise, postproc_params, disaggregated_params)
+                # Log decoding_iter and acceptance rate for non-streaming requests
+                num_generated_tokens = len(promise.outputs[0].token_ids) if promise.outputs[0].token_ids else 0
+                acceptance_rate = num_generated_tokens / (promise.decoding_iter + 1) if promise.decoding_iter > 0 else 0.0
+                logger.info(f"Chat completion request {promise.request_id} completed with decoding_iter: {promise.decoding_iter}, acceptance_rate: {acceptance_rate:.4f}")
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             logger.error(traceback.format_exc())
@@ -367,6 +375,10 @@ class OpenAIServer:
                     pp_result = output.outputs[0]._postprocess_result
                 for pp_res in pp_result:
                     yield pp_res
+            # Log decoding_iter and acceptance rate for streaming completion requests when generation ends
+            num_generated_tokens = len(promise.outputs[0].token_ids) if promise.outputs[0].token_ids else 0
+            acceptance_rate = num_generated_tokens / (promise.decoding_iter + 1) if promise.decoding_iter > 0 else 0.0
+            logger.info(f"Completion streaming request {promise.request_id} completed with decoding_iter: {promise.decoding_iter}, acceptance_rate: {acceptance_rate:.4f}")
 
         async def merge_generators(generators: List[AsyncIterator[Any]]):
             result_queue = asyncio.Queue()
@@ -438,6 +450,11 @@ class OpenAIServer:
                 rsps = await asyncio.gather(*[completion_response(promise, params)
                                               for promise, params in zip(promises, postproc_params_collection)])
                 response = merge_completion_responses(rsps) if len(rsps) > 1 else rsps[0]
+                # Log decoding_iter and acceptance rate for non-streaming requests
+                for i, promise in enumerate(promises):
+                    num_generated_tokens = len(promise.outputs[0].token_ids) if promise.outputs[0].token_ids else 0
+                    acceptance_rate = num_generated_tokens / (promise.decoding_iter + 1) if promise.decoding_iter > 0 else 0.0
+                    logger.info(f"Completion request {promise.request_id} (prompt {i}) completed with decoding_iter: {promise.decoding_iter}, acceptance_rate: {acceptance_rate:.4f}")
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             logger.error(traceback.format_exc())
